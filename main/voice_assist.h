@@ -21,7 +21,7 @@ void nino_voice_assist_set_ws_uri(const char *uri);
 /** Create WS-URI mutex (call once from app_main before console). */
 esp_err_t nino_voice_assist_init_mutex(void);
 
-/** Embedded main/beep.wav — played on wake ("Hi ESP" or "Jarvis"). */
+/** Embedded main/beep.wav — played on wake ("Ok Nino"). */
 esp_err_t nino_voice_play_wake_chime(void);
 
 /** Decode beep + warm ES8311 at 16 kHz — call once after nino_audio_init(). */
@@ -31,7 +31,9 @@ esp_err_t nino_voice_preload_wake_chime(void);
 esp_err_t nino_voice_play_done_chime(void);
 
 /**
- * Energy VAD: wait for speech, record until trailing silence or max_seconds.
+ * Energy VAD + adaptive end-of-utterance: wait for speech, record until
+ * adaptive trailing silence (or max_seconds). Mid-utterance pauses raise the
+ * stop timeout within clamped bounds (see docs/ADVA_PLAN.md).
  * Output is 16-bit mono WAV at 16 kHz. Caller frees with nino_audio_capture_free().
  */
 esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t *out_len);

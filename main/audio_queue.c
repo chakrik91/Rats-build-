@@ -14,6 +14,7 @@
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "voice_assist.h"
+#include "music_stream.h"
 
 static const char *TAG = "audio_q";
 
@@ -142,6 +143,9 @@ static bool play_normal_job(audio_play_job_t *job) {
     if (has_expr) {
       nino_eye_idle();
     }
+    if (!nino_music_is_user_paused()) {
+      nino_music_pause_for_speech(false);
+    }
     return true;
   }
   free(job->data);
@@ -185,6 +189,8 @@ static bool play_normal_job(audio_play_job_t *job) {
       nino_voice_assist_set_next_prompt_ack_chime(false);
     }
     nino_voice_assist_prompt_medical_ack();
+  } else if (!nino_music_is_user_paused()) {
+    nino_music_pause_for_speech(false);
   }
   nino_decoded_wav_free(&decoded);
   s_normal_playing = false;
@@ -229,6 +235,8 @@ static bool play_suspended(void) {
       nino_voice_assist_set_next_prompt_ack_chime(false);
     }
     nino_voice_assist_prompt_medical_ack();
+  } else if (!nino_music_is_user_paused()) {
+    nino_music_pause_for_speech(false);
   }
   nino_decoded_wav_free(&snap.decoded);
   s_normal_playing = false;
@@ -403,6 +411,7 @@ void nino_audio_queue_wait_idle(uint32_t timeout_ms) {
 }
 
 void nino_audio_queue_preempt_for_wake(void) {
+  nino_music_pause_for_speech(true);
   if (s_normal_queue == NULL) {
     return;
   }

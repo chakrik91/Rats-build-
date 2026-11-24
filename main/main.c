@@ -48,6 +48,7 @@
 #include "face_detect.hpp"
 #include "face_tracker.h"
 #include "mic_input.h"
+#include "music_stream.h"
 #include "nino_eye.h"
 #include "ssd1351.h"
 #include "servo_dxl.h"
@@ -67,6 +68,7 @@
 
 #define NVS_NAMESPACE "wifi_cfg"
 #define NVS_KEY_VOICE_WS "voice_ws"
+#define NVS_KEY_VOICE_LOCK "voice_lock"
 #define NVS_KEY_MODE "mode"
 #define NVS_KEY_STA_SSID "sta_ssid"
 #define NVS_KEY_STA_PASS "sta_pass"
@@ -178,6 +180,7 @@ static latest_frame_t s_latest_frame;
 static httpd_handle_t s_http_server;
 static esp_console_repl_t *s_repl;
 static char s_voice_ws_url[200];
+static bool s_voice_url_locked;
 static bool s_voice_wake_started;
 static int64_t s_last_uvc_timeout_log_us;
 static char s_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
@@ -375,7 +378,7 @@ static void finish_boot_greeting_and_enable_wake(void) {
   s_boot_greeting_done = true;
   if (nino_voice_wake_hw_ready()) {
     nino_voice_wake_set_enabled(true);
-    ESP_LOGI(TAG, "Wake word on — say \"Hi ESP\" or \"Jarvis\"");
+    ESP_LOGI(TAG, "Wake word on — say \"Ok Nino\"");
   }
 }
 
@@ -485,6 +488,9 @@ static void mdns_start_service(void) {
       {"ble_name", s_device_name},
       {"transport", "http"},
       {"path", "/status"},
+      {"audio", "ws"},
+      {"audio_path", "/ws/audio-stream"},
+      {"pcm_rate", "22050"},
   };
   err = mdns_service_txt_set(MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, txt,
                              sizeof(txt) / sizeof(txt[0]));
@@ -533,7 +539,7 @@ static void voice_wake_start_once(void) {
     }
   } else {
     nino_voice_wake_set_enabled(false);
-    ESP_LOGE(TAG, "Wake word not started — check srmodels partition / flash size");
+    ESP_LOGE(TAG, "Wake word not started — check ok_nino_v6.tflite embed / TFLM");
   }
 }
 
@@ -1748,6 +1754,12 @@ static void auto_pair_voice_from_discovery_peer(const struct sockaddr_in *peer) 
     return;
   }
 
+  if (s_voice_url_locked) {
+    ESP_LOGI(TAG, "Discovery: ignore auto-pair (voice url locked) keep %s",
+             s_voice_ws_url[0] ? s_voice_ws_url : "(empty)");
+    return;
+  }
+
   ESP_LOGI(TAG, "Discovery: auto-pairing voice to %s", uri);
   apply_voice_ws_url_from_server(uri);
 }
@@ -2179,6 +2191,42 @@ static bool parse_json_bool_field(const char *body, const char *key, bool *out) 
     return true;
   }
   return false;
+}
+
+static bool parse_json_string_field(const char *body, const char *key, char *out,
+                                    size_t out_len) {
+  if (body == NULL || key == NULL || out == NULL || out_len == 0) {
+    return false;
+  }
+  char pattern[24];
+  int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  if (pn <= 0 || pn >= (int)sizeof(pattern)) {
+    return false;
+  }
+  const char *p = strstr(body, pattern);
+  if (p == NULL) {
+    return false;
+  }
+  const char *colon = strchr(p + pn, ':');
+  if (colon == NULL) {
+    return false;
+  }
+  const char *q1 = strchr(colon, '"');
+  if (q1 == NULL) {
+    return false;
+  }
+  q1++;
+  const char *q2 = strchr(q1, '"');
+  if (q2 == NULL || q2 <= q1) {
+    return false;
+  }
+  size_t n = (size_t)(q2 - q1);
+  if (n >= out_len) {
+    n = out_len - 1;
+  }
+  memcpy(out, q1, n);
+  out[n] = '\0';
+  return out[0] != '\0';
 }
 
 static esp_err_t eye_expression_handler(httpd_req_t *req) {
@@ -2685,6 +2733,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
   return httpd_resp_send(req, body, n);
 }
 
+static int music_status_json(char *body, size_t body_sz);
+
 #if CONFIG_HTTPD_WS_SUPPORT
 static esp_err_t status_ws_send(httpd_req_t *req) {
   char body[640];
@@ -2748,6 +2798,250 @@ static esp_err_t status_ws_handler(httpd_req_t *req) {
 
   free(payload);
   return err;
+}
+
+static int s_audio_ws_fd = -1;
+
+static bool json_cmd_is(const char *body, const char *cmd) {
+  if (body == NULL || cmd == NULL) {
+    return false;
+  }
+  const char *p = strstr(body, "\"cmd\"");
+  if (p == NULL) {
+    return false;
+  }
+  p = strchr(p + 5, ':');
+  if (p == NULL) {
+    return false;
+  }
+  p++;
+  while (*p == ' ' || *p == '\t') {
+    p++;
+  }
+  if (*p != '"') {
+    return false;
+  }
+  p++;
+  size_t n = strlen(cmd);
+  return strncmp(p, cmd, n) == 0 && p[n] == '"';
+}
+
+static bool json_u32_field(const char *body, const char *key, uint32_t *out) {
+  if (body == NULL || key == NULL || out == NULL) {
+    return false;
+  }
+  char needle[32];
+  int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
+  if (n <= 0 || n >= (int)sizeof(needle)) {
+    return false;
+  }
+  const char *p = strstr(body, needle);
+  if (p == NULL) {
+    return false;
+  }
+  p = strchr(p + n, ':');
+  if (p == NULL) {
+    return false;
+  }
+  p++;
+  while (*p == ' ' || *p == '\t') {
+    p++;
+  }
+  char *end = NULL;
+  unsigned long v = strtoul(p, &end, 10);
+  if (end == p) {
+    return false;
+  }
+  *out = (uint32_t)v;
+  return true;
+}
+
+static esp_err_t audio_ws_send_text(httpd_req_t *req, const char *msg) {
+  httpd_ws_frame_t out = {
+      .type = HTTPD_WS_TYPE_TEXT,
+      .payload = (uint8_t *)msg,
+      .len = strlen(msg),
+  };
+  return httpd_ws_send_frame(req, &out);
+}
+
+static esp_err_t audio_ws_send_status(httpd_req_t *req) {
+  char body[192];
+  int n = music_status_json(body, sizeof(body));
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return audio_ws_send_text(req, "{\"ok\":false,\"error\":\"internal\"}");
+  }
+  return audio_ws_send_text(req, body);
+}
+
+static esp_err_t audio_ws_send_err(httpd_req_t *req, const char *error) {
+  char body[96];
+  int n = snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", error);
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return audio_ws_send_text(req, "{\"ok\":false,\"error\":\"internal\"}");
+  }
+  return audio_ws_send_text(req, body);
+}
+
+#define AUDIO_WS_MAX_FRAME (16 * 1024)
+
+static esp_err_t audio_stream_ws_handler(httpd_req_t *req) {
+  int fd = httpd_req_to_sockfd(req);
+  if (req->method == HTTP_GET) {
+    ESP_LOGI(TAG, "Audio WS handshake fd=%d", fd);
+    return ESP_OK;
+  }
+
+  httpd_ws_frame_t in = {};
+  esp_err_t err = httpd_ws_recv_frame(req, &in, 0);
+  if (err != ESP_OK) {
+    if (fd == s_audio_ws_fd) {
+      s_audio_ws_fd = -1;
+      nino_music_stop();
+    }
+    return err;
+  }
+
+  if (in.type == HTTPD_WS_TYPE_CLOSE || in.type == HTTPD_WS_TYPE_PING ||
+      in.type == HTTPD_WS_TYPE_PONG) {
+    uint8_t *ctrl = NULL;
+    if (in.len > 0) {
+      ctrl = malloc(in.len);
+      if (ctrl == NULL) {
+        return ESP_ERR_NO_MEM;
+      }
+      in.payload = ctrl;
+      err = httpd_ws_recv_frame(req, &in, in.len);
+      if (err != ESP_OK) {
+        free(ctrl);
+        if (fd == s_audio_ws_fd) {
+          s_audio_ws_fd = -1;
+          nino_music_stop();
+        }
+        return err;
+      }
+    }
+    if (in.type == HTTPD_WS_TYPE_CLOSE) {
+      if (fd == s_audio_ws_fd) {
+        s_audio_ws_fd = -1;
+        nino_music_stop();
+      }
+    } else if (in.type == HTTPD_WS_TYPE_PING) {
+      httpd_ws_frame_t pong = {
+          .type = HTTPD_WS_TYPE_PONG,
+          .payload = ctrl,
+          .len = in.len,
+      };
+      err = httpd_ws_send_frame(req, &pong);
+      free(ctrl);
+      return err;
+    }
+    free(ctrl);
+    return ESP_OK;
+  }
+  if (in.len == 0) {
+    return ESP_OK;
+  }
+  if (in.len > AUDIO_WS_MAX_FRAME) {
+    return audio_ws_send_err(req, "frame_too_large");
+  }
+
+  uint8_t *payload = calloc(1, in.len + 1);
+  if (payload == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+  in.payload = payload;
+  err = httpd_ws_recv_frame(req, &in, in.len);
+  if (err != ESP_OK) {
+    free(payload);
+    if (fd == s_audio_ws_fd) {
+      s_audio_ws_fd = -1;
+      nino_music_stop();
+    }
+    return err;
+  }
+
+  if (in.type == HTTPD_WS_TYPE_BINARY) {
+    if (s_audio_ws_fd >= 0 && s_audio_ws_fd != fd) {
+      free(payload);
+      return audio_ws_send_err(req, "busy");
+    }
+    nino_music_status_t st;
+    nino_music_get_status(&st);
+    if (!st.session) {
+      err = nino_music_push_start(22050, 1, 16);
+      if (err != ESP_OK) {
+        free(payload);
+        return audio_ws_send_err(req, "start_failed");
+      }
+    }
+    s_audio_ws_fd = fd;
+    err = nino_music_push_pcm(payload, in.len);
+    free(payload);
+    if (err == ESP_ERR_NO_MEM) {
+      return audio_ws_send_text(req, "{\"state\":\"backpressure\"}");
+    }
+    if (err != ESP_OK) {
+      return audio_ws_send_err(req, "not_streaming");
+    }
+    return ESP_OK;
+  }
+
+  if (in.type != HTTPD_WS_TYPE_TEXT) {
+    free(payload);
+    return ESP_OK;
+  }
+
+  if (json_cmd_is((char *)payload, "start")) {
+    uint32_t rate = 22050;
+    uint32_t channels = 1;
+    uint32_t bits = 16;
+    (void)json_u32_field((char *)payload, "rate", &rate);
+    (void)json_u32_field((char *)payload, "channels", &channels);
+    (void)json_u32_field((char *)payload, "bits", &bits);
+    free(payload);
+    err = nino_music_push_start(rate, (uint16_t)channels, (uint16_t)bits);
+    if (err == ESP_ERR_INVALID_ARG) {
+      return audio_ws_send_err(req, "invalid_format");
+    }
+    if (err != ESP_OK) {
+      return audio_ws_send_err(req, "start_failed");
+    }
+    s_audio_ws_fd = fd;
+    return audio_ws_send_text(req, "{\"ok\":true,\"state\":\"buffering\"}");
+  }
+
+  if (json_cmd_is((char *)payload, "pause")) {
+    free(payload);
+    err = nino_music_pause();
+    if (err != ESP_OK) {
+      return audio_ws_send_err(req, "idle");
+    }
+    return audio_ws_send_status(req);
+  }
+  if (json_cmd_is((char *)payload, "resume")) {
+    free(payload);
+    err = nino_music_resume();
+    if (err != ESP_OK) {
+      return audio_ws_send_err(req, "idle");
+    }
+    return audio_ws_send_status(req);
+  }
+  if (json_cmd_is((char *)payload, "stop")) {
+    free(payload);
+    nino_music_stop();
+    if (fd == s_audio_ws_fd) {
+      s_audio_ws_fd = -1;
+    }
+    return audio_ws_send_text(req, "{\"ok\":true,\"state\":\"idle\"}");
+  }
+  if (json_cmd_is((char *)payload, "ping")) {
+    free(payload);
+    return audio_ws_send_status(req);
+  }
+
+  free(payload);
+  return audio_ws_send_err(req, "bad_cmd");
 }
 #endif
 
@@ -2944,20 +3238,35 @@ static esp_err_t device_name_handler(httpd_req_t *req) {
   return httpd_resp_send(req, out, n);
 }
 
+static void persist_voice_url_lock(bool locked) {
+  s_voice_url_locked = locked;
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+    (void)nvs_set_u8(h, NVS_KEY_VOICE_LOCK, locked ? 1 : 0);
+    (void)nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
 static void load_voice_ws_from_nvs(void) {
   s_voice_ws_url[0] = '\0';
+  s_voice_url_locked = false;
   nvs_handle_t h;
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
     return;
   }
   size_t sz = sizeof(s_voice_ws_url);
   (void)nvs_get_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url, &sz);
+  uint8_t locked = 0;
+  if (nvs_get_u8(h, NVS_KEY_VOICE_LOCK, &locked) == ESP_OK) {
+    s_voice_url_locked = locked != 0;
+  }
   nvs_close(h);
   ensure_voice_ws_url_has_device_id();
 }
 
 static void apply_voice_ws_url_from_server(const char *uri) {
-  if (uri == NULL || uri[0] == '\0') {
+  if (uri == NULL || uri[0] == '\0' || s_voice_url_locked) {
     return;
   }
   strncpy(s_voice_ws_url, uri, sizeof(s_voice_ws_url) - 1);
@@ -2979,7 +3288,7 @@ static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
     if (argc < 3) {
       printf("Usage: voice connect <IPv4> [port]   (default port 8000)\n"
-             "  Saves ws://<ip>:<port>/voice-query?device_id=... for Hi ESP / Jarvis wake flow\n");
+             "  Saves ws://<ip>:<port>/voice-query?device_id=... for Ok Nino wake flow\n");
       return 0;
     }
     int port = 8000;
@@ -3006,10 +3315,12 @@ static int cmd_voice(int argc, char **argv) {
     } else {
       printf("NVS open failed\n");
     }
+    persist_voice_url_lock(true);
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
     nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
     schedule_wifi_network_report();
-    printf("Voice assistant: %s\n", s_voice_ws_url);
+    printf("Voice assistant: %s (locked; discovery will not overwrite)\n",
+           s_voice_ws_url);
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "url") == 0) {
@@ -3029,9 +3340,17 @@ static int cmd_voice(int argc, char **argv) {
     } else {
       printf("NVS open failed\n");
     }
+    persist_voice_url_lock(true);
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
     nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
     schedule_wifi_network_report();
+    printf("Voice assistant: %s (locked; discovery will not overwrite)\n",
+           s_voice_ws_url);
+    return 0;
+  }
+  if (argc >= 2 && strcmp(argv[1], "unlock") == 0) {
+    persist_voice_url_lock(false);
+    printf("voice url unlocked — discovery may auto-pair again\n");
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
@@ -3039,14 +3358,15 @@ static int cmd_voice(int argc, char **argv) {
     printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
     printf("voice mic: %s\n",
            nino_mic_source_name(nino_mic_preferred_source()));
-    printf("usb header mic: %s\n",
+    printf("usb j18 mic: %s\n",
            usb_mic_ready() ? "streaming (preferred)"
                            : "not ready; using onboard ES8311 fallback");
     usb_mic_print_status();
     usb_mic_print_usb_devices();
     printf("device_id: %s\n", s_device_id);
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
-    printf("Tip: voice connect must use your PC LAN IP (where python app.py runs), not 192.168.x.x of the board.\n");
+    printf("voice url lock: %s\n", s_voice_url_locked ? "on (manual)" : "off (discovery may overwrite)");
+    printf("Tip: voice connect <PC_IP> [port]  then  voice url\n");
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "wake") == 0) {
@@ -3065,7 +3385,7 @@ static int cmd_voice(int argc, char **argv) {
     printf("Usage: voice wake [on|off]\n");
     return 1;
   }
-  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice wake [on|off] | voice status\n");
+  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice unlock | voice wake [on|off] | voice status\n");
   return 0;
 }
 
@@ -3113,7 +3433,7 @@ static int cmd_device(int argc, char **argv) {
 static void voice_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "voice",
-      .help = "voice connect <PC_IP> [port] | voice status | voice wake [on|off]",
+      .help = "voice connect <PC_IP> [port] | voice unlock | voice status",
       .hint = NULL,
       .func = &cmd_voice,
       .argtable = NULL,
@@ -3424,11 +3744,147 @@ static void speaker_cli_register(void) {
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+static esp_err_t music_json_error(httpd_req_t *req, const char *status, const char *error) {
+  char body[96];
+  int n = snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", error);
+  httpd_resp_set_status(req, status);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"internal\"}", HTTPD_RESP_USE_STRLEN);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
+static void music_drain_body(httpd_req_t *req) {
+  int remaining = req->content_len;
+  char discard[64];
+  while (remaining > 0) {
+    int chunk = remaining > (int)sizeof(discard) ? (int)sizeof(discard) : remaining;
+    int r = httpd_req_recv(req, discard, chunk);
+    if (r <= 0) {
+      break;
+    }
+    remaining -= r;
+  }
+}
+
+static int music_status_json(char *body, size_t body_sz) {
+  nino_music_status_t st;
+  nino_music_get_status(&st);
+  return snprintf(body, body_sz,
+                  "{\"ok\":true,\"playing\":%s,\"paused\":%s,\"state\":\"%s\","
+                  "\"buffered_ms\":%u,\"position_ms\":%u,\"rate\":%u}",
+                  st.session ? "true" : "false", st.paused ? "true" : "false",
+                  nino_music_state_str(st.state), (unsigned)st.buffered_ms,
+                  (unsigned)st.position_ms, (unsigned)st.rate_hz);
+}
+
+static esp_err_t music_play_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  if (req->content_len <= 0 || req->content_len > 448) {
+    return music_json_error(req, "400 Bad Request", "bad_body");
+  }
+
+  char body[449] = {0};
+  int received = 0;
+  while (received < req->content_len) {
+    int r = httpd_req_recv(req, body + received, req->content_len - received);
+    if (r <= 0) {
+      return music_json_error(req, "400 Bad Request", "recv");
+    }
+    received += r;
+  }
+  body[received] = '\0';
+
+  char url[384] = {0};
+  if (!parse_json_string_field(body, "url", url, sizeof(url))) {
+    return music_json_error(req, "400 Bad Request", "bad_url");
+  }
+
+  esp_err_t err = nino_music_start(url);
+  if (err == ESP_ERR_INVALID_ARG) {
+    return music_json_error(req, "400 Bad Request", "bad_url");
+  }
+  if (err != ESP_OK) {
+    return music_json_error(req, "503 Service Unavailable", "start_failed");
+  }
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t music_stop_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  music_drain_body(req);
+  nino_music_stop();
+  return httpd_resp_send(req, "{\"ok\":true,\"state\":\"idle\"}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t music_pause_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  music_drain_body(req);
+  esp_err_t err = nino_music_pause();
+  if (err != ESP_OK) {
+    return music_json_error(req, "409 Conflict", "idle");
+  }
+  char body[192];
+  int n = music_status_json(body, sizeof(body));
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
+static esp_err_t music_resume_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  music_drain_body(req);
+  esp_err_t err = nino_music_resume();
+  if (err != ESP_OK) {
+    return music_json_error(req, "409 Conflict", "idle");
+  }
+  char body[192];
+  int n = music_status_json(body, sizeof(body));
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
+static esp_err_t music_status_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (req->method != HTTP_GET) {
+    return music_json_error(req, "405 Method Not Allowed", "GET only");
+  }
+  char body[192];
+  int n = music_status_json(body, sizeof(body));
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
 static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 40;
+  config.max_uri_handlers = 56;
   config.max_open_sockets = 7; /* ESP-IDF max on this target (httpd reserves 3 internally) */
   config.lru_purge_enable = true;
   config.recv_wait_timeout = 45;
@@ -3471,6 +3927,36 @@ static void start_http_server(void) {
       .uri = "/play_wav",
       .method = HTTP_POST,
       .handler = play_wav_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_play_uri = {
+      .uri = "/music/play",
+      .method = HTTP_POST,
+      .handler = music_play_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_stop_uri = {
+      .uri = "/music/stop",
+      .method = HTTP_POST,
+      .handler = music_stop_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_pause_uri = {
+      .uri = "/music/pause",
+      .method = HTTP_POST,
+      .handler = music_pause_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_resume_uri = {
+      .uri = "/music/resume",
+      .method = HTTP_POST,
+      .handler = music_resume_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_status_uri = {
+      .uri = "/music/status",
+      .method = HTTP_GET,
+      .handler = music_status_handler,
       .user_ctx = NULL,
   };
   const httpd_uri_t servo_360_uri = {
@@ -3549,6 +4035,15 @@ static void start_http_server(void) {
       .handle_ws_control_frames = false,
       .supported_subprotocol = NULL,
   };
+  const httpd_uri_t audio_stream_ws_uri = {
+      .uri = "/ws/audio-stream",
+      .method = HTTP_GET,
+      .handler = audio_stream_ws_handler,
+      .user_ctx = NULL,
+      .is_websocket = true,
+      .handle_ws_control_frames = true,
+      .supported_subprotocol = NULL,
+  };
 #endif
   const httpd_uri_t wifi_prov_config_uri = {
       .uri = "/api/wifi/config",
@@ -3593,6 +4088,11 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_mjpeg_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_play_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_stop_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_pause_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_resume_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_status_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
   ESP_ERROR_CHECK(nino_servo_recplay_register_http(s_http_server));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &eye_expression_uri));
@@ -3609,6 +4109,7 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_opts_uri));
 #if CONFIG_HTTPD_WS_SUPPORT
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_ws_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &audio_stream_ws_uri));
 #endif
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &wifi_prov_config_uri));
@@ -3622,6 +4123,8 @@ static void start_http_server(void) {
       httpd_register_uri_handler(s_http_server, &device_name_post_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &device_name_opts_uri));
+  ESP_LOGI(TAG, "HTTP server :%d (max_uri_handlers=%u)", HTTP_SERVER_PORT,
+           (unsigned)config.max_uri_handlers);
 }
 
 static void usb_lib_task(void *arg) {
@@ -3943,6 +4446,9 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(nino_audio_queue_start());
   s_audio_queue_ready = true;
+  if (nino_music_init() != ESP_OK) {
+    ESP_LOGW(TAG, "Music stream init failed; POST /music/play will return 503");
+  }
   schedule_wifi_connected_chime();
   if (!wifi_config_is_provisioned()) {
     /* No saved network: tell the user to open the app while BLE provisioning
@@ -3999,9 +4505,9 @@ void app_main(void) {
 
   esp_err_t mic_err = usb_mic_start();
   if (mic_err != ESP_OK) {
-    ESP_LOGE(TAG, "USB header mic UAC failed: %s", esp_err_to_name(mic_err));
+    ESP_LOGE(TAG, "USB J18 mic UAC failed: %s", esp_err_to_name(mic_err));
   } else {
-    ESP_LOGI(TAG, "USB 4-mic UAC started (GPIO D-=24 D+=25, 5V+GND)");
+    ESP_LOGI(TAG, "USB 4-mic UAC started (plug ReSpeaker into J18 hub)");
   }
 
   if (nino_servo_dxl_start() != ESP_OK) {
@@ -4031,8 +4537,7 @@ void app_main(void) {
   (void)xTaskCreatePinnedToCore(delayed_voice_wake_task, "wake_delay", 4096, NULL, 3, NULL,
                                 APP_CORE_NET);
 
-  ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
-  ESP_LOGI(TAG, "GPIO header: USB 4-mic for voice (separate from J18 hub)");
+  ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 + USB 4-mic");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

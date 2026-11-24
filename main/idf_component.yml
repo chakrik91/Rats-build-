@@ -1,6 +1,6 @@
 dependencies:
-  espressif/esp-sr:
-    version: "^2.4.0"
+  espressif/esp-tflite-micro:
+    version: "*"
   espressif/esp_websocket_client:
     version: "1.7.0"
   espressif/esp_hosted:
@@ -27,6 +27,9 @@ dependencies:
     version: "*"
     rules:
       - if: "target in [esp32p4]"
+  # 2.9.0 uses DSI on_frame_buf_complete; IDF 5.5.2 still has on_refresh_done.
+  espressif/esp_lvgl_port:
+    version: "2.8.0"
   espressif/mdns:
     version: "*"
   idf: ">=5.5"

@@ -33,7 +33,7 @@ static const char *TAG = "usb_mic";
 #define USB_MIC_RING_BYTES (USB_MIC_OUTPUT_RATE_HZ * USB_MIC_RING_SECONDS * (int)sizeof(int16_t))
 /*
  * Reduce the original 16x boost to limit ambient-noise amplification while
- * retaining enough level for normal-distance WakeNet detection.
+ * retaining enough level for normal-distance Ok Nino detection.
  */
 #define USB_MIC_SW_GAIN_NUM 8
 #define USB_MIC_SW_GAIN_DEN 1
@@ -90,8 +90,8 @@ static volatile int32_t s_last_peak;
 static volatile bool s_has_audio;
 static int64_t s_uac_open_us;
 static uint8_t s_active_iface;
-static uint8_t s_header_mic_addr;
-static uint8_t s_header_mic_iface;
+static uint8_t s_voice_mic_addr;
+static uint8_t s_voice_mic_iface;
 static usb_mic_fail_t s_failed_opens[8];
 static size_t s_failed_open_count;
 
@@ -193,9 +193,9 @@ void usb_mic_block_dev_addr(uint8_t dev_addr) {
     return;
   }
   addr_mark_blocked(dev_addr);
-  ESP_LOGI(TAG, "Blocking UAC on USB addr=%u (not the GPIO header mic)", dev_addr);
-  /* Only tear down UAC if this addr is the one we opened — blocking the J18 camera
-   * must not close the GPIO-header ReSpeaker on a different address. */
+  ESP_LOGI(TAG, "Blocking UAC on USB addr=%u (camera/other, not ReSpeaker)", dev_addr);
+  /* Only tear down UAC if this addr is the one we opened — blocking the camera
+   * must not close the J18 ReSpeaker on a different address. */
   if (s_mic_dev != NULL && s_active_addr == dev_addr) {
     ESP_LOGW(TAG, "Closing UAC handle on blocked addr=%u", dev_addr);
     uac_host_device_handle_t dev = s_mic_dev;
@@ -228,7 +228,7 @@ static bool read_usb_ids(usb_device_handle_t hdl, uint16_t *vid, uint16_t *pid,
   return true;
 }
 
-static bool is_header_respeaker(uint8_t addr, uint16_t *vid_out, uint16_t *pid_out) {
+static bool is_respeaker_uac(uint8_t addr, uint16_t *vid_out, uint16_t *pid_out) {
   if (s_uac_client == NULL) {
     return false;
   }
@@ -241,15 +241,18 @@ static bool is_header_respeaker(uint8_t addr, uint16_t *vid_out, uint16_t *pid_o
   uint16_t vid = 0;
   uint16_t pid = 0;
   usb_device_info_t info = {};
-  const bool valid = read_usb_ids(hdl, &vid, &pid, NULL) &&
-                     usb_host_device_info(hdl, &info) == ESP_OK &&
-                     vid == RESPEAKER_VID && pid == RESPEAKER_PID &&
-                     info.parent.dev_hdl == NULL && info.speed == USB_SPEED_FULL;
+  const bool ids_ok = read_usb_ids(hdl, &vid, &pid, NULL);
+  const bool info_ok = usb_host_device_info(hdl, &info) == ESP_OK;
+  const bool is_respeaker = ids_ok && vid == RESPEAKER_VID && pid == RESPEAKER_PID;
   usb_host_device_close(s_uac_client, hdl);
-  if (!valid) {
-    ESP_LOGW(TAG, "Ignore UAC addr=%u — expected root-port ReSpeaker %04x:%04x",
-             addr, RESPEAKER_VID, RESPEAKER_PID);
+  if (!is_respeaker) {
+    ESP_LOGW(TAG, "Ignore UAC addr=%u %04x:%04x — want ReSpeaker %04x:%04x on J18",
+             addr, vid, pid, RESPEAKER_VID, RESPEAKER_PID);
     return false;
+  }
+  if (info_ok) {
+    ESP_LOGI(TAG, "ReSpeaker UAC addr=%u %04x:%04x parent=%s", addr, vid, pid,
+             info.parent.dev_hdl ? "J18 hub" : "root");
   }
   if (vid_out != NULL) {
     *vid_out = vid;
@@ -564,8 +567,8 @@ static void uac_device_callback(uac_host_device_handle_t uac_device_handle,
     }
     ESP_LOGW(TAG, "USB mic disconnected — deferring UAC close");
     /* Host keeps the iface until the app closes it, but close must run outside
-     * this callback (see queue_mic_device_close). Keep s_header_mic_* so retry
-     * can reopen the GPIO-header ReSpeaker after a transient drop. */
+     * this callback (see queue_mic_device_close). Keep s_voice_mic_* so retry
+     * can reopen the J18 ReSpeaker after a transient drop. */
     uac_host_device_handle_t dev = s_mic_dev;
     s_mic_dev = NULL;
     reset_mic_stream_state();
@@ -593,7 +596,7 @@ static void uac_host_lib_callback(uint8_t addr, uint8_t iface_num,
   }
 
   const usb_mic_connect_req_t req = {.addr = addr, .iface_num = iface_num};
-  ESP_LOGI(TAG, "UAC RX addr=%u iface=%u — queued (worker opens GPIO-header FS only)", addr,
+  ESP_LOGI(TAG, "UAC RX addr=%u iface=%u — queued (worker opens J18 ReSpeaker only)", addr,
            iface_num);
   if (xQueueSend(s_connect_queue, &req, 0) != pdTRUE) {
     ESP_LOGW(TAG, "UAC connect queue full — drop addr=%u iface=%u", addr, iface_num);
@@ -607,11 +610,11 @@ static void process_uac_connect_request(const usb_mic_connect_req_t *req) {
 
   uint16_t vid = 0;
   uint16_t pid = 0;
-  if (!is_header_respeaker(req->addr, &vid, &pid)) {
+  if (!is_respeaker_uac(req->addr, &vid, &pid)) {
     return;
   }
-  s_header_mic_addr = req->addr;
-  s_header_mic_iface = req->iface_num;
+  s_voice_mic_addr = req->addr;
+  s_voice_mic_iface = req->iface_num;
 
   if (s_open_mutex != NULL &&
       xSemaphoreTake(s_open_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
@@ -640,7 +643,7 @@ static void process_uac_connect_request(const usb_mic_connect_req_t *req) {
   uac_host_dev_alt_param_t alt = {};
   uint32_t mic_freq = USB_MIC_OUTPUT_RATE_HZ;
   if (!try_start_mic(mic, &alt, &mic_freq)) {
-    ESP_LOGE(TAG, "UAC mic start failed addr=%u iface=%u (check 5V/GND/GPIO24/25)", req->addr,
+    ESP_LOGE(TAG, "UAC mic start failed addr=%u iface=%u (check ReSpeaker on J18 hub)", req->addr,
              req->iface_num);
     close_mic_device(mic);
     goto out_unlock;
@@ -726,14 +729,13 @@ static void usb_mic_retry_task(void *arg) {
       continue;
     }
 
-    /* A valid header mic can temporarily drop its UAC stream during heavy USB
-     * activity. Retry only that known device/interface; never probe arbitrary
-     * hub or stale addresses. */
-    if (s_header_mic_addr != 0 && s_header_mic_iface != 0 &&
+    /* A valid J18 ReSpeaker can temporarily drop its UAC stream during heavy USB
+     * activity. Retry only that known device/interface. */
+    if (s_voice_mic_addr != 0 && s_voice_mic_iface != 0 &&
         s_mic_dev == NULL) {
       const usb_mic_connect_req_t req = {
-          .addr = s_header_mic_addr,
-          .iface_num = s_header_mic_iface,
+          .addr = s_voice_mic_addr,
+          .iface_num = s_voice_mic_iface,
       };
       process_uac_connect_request(&req);
     }

@@ -91,7 +91,7 @@ esp_err_t nino_mic_read(int16_t *samples, int sample_count) {
   if (usb_mic_ready()) {
     /* Do not hold the speaker/ES8311 mutex for every USB frame. Speaker
      * playback holds that mutex for the clip duration; blocking here starves
-     * WakeNet. Close ES8311 once when USB becomes available. */
+     * wake detect. Close ES8311 once when USB becomes available. */
     if (!s_usb_mic_selected) {
       nino_audio_bus_lock();
       close_es8311_mic_locked();

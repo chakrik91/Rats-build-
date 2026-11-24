@@ -18,6 +18,7 @@
 #include "nino_eye.h"
 #include "voice_wake.h"
 #include "voice_ws_client.h"
+#include "music_stream.h"
 
 extern const uint8_t beep_wav_start[] asm("_binary_beep_wav_start");
 extern const uint8_t beep_wav_end[] asm("_binary_beep_wav_end");
@@ -28,7 +29,6 @@ static const char *TAG = "voice_ast";
 #define WAV_HEADER_SIZE 44
 #define VAD_FRAME_MS 20
 #define VAD_LISTEN_TIMEOUT_MS 6000
-#define VAD_TRAILING_SILENCE_MS 450
 #define VAD_PRE_ROLL_MS 200
 #define VAD_START_CONSECUTIVE_FRAMES 3
 #define VAD_STATUS_LOG_PERIOD_MS 1000
@@ -41,10 +41,19 @@ static const char *TAG = "voice_ast";
 #define VAD_SILENCE_PEAK_RATIO_PCT 30
 #define VAD_MIN_SPEECH_MS 300
 
+/**
+ * Adaptive end-of-utterance (EOU): how long trailing silence must last before
+ * we stop recording. Mid-utterance pauses (speech→silence→speech) raise the
+ * timeout within [EOU_MIN_MS, EOU_MAX_MS]. See docs/ADVA_PLAN.md.
+ */
+#define EOU_DEFAULT_MS 750
+#define EOU_MIN_MS 500
+#define EOU_MAX_MS 1500
+#define EOU_MARGIN_MS 350
+
 #define VAD_FRAME_SAMPLES ((VOICE_MIC_RATE * VAD_FRAME_MS) / 1000)
 #define VAD_FRAME_BYTES (VAD_FRAME_SAMPLES * (int)sizeof(int16_t))
 #define VAD_LISTEN_FRAMES (VAD_LISTEN_TIMEOUT_MS / VAD_FRAME_MS)
-#define VAD_SILENCE_STOP_FRAMES (VAD_TRAILING_SILENCE_MS / VAD_FRAME_MS)
 #define VAD_PRE_ROLL_FRAMES (VAD_PRE_ROLL_MS / VAD_FRAME_MS)
 #define VAD_MIN_SPEECH_FRAMES (VAD_MIN_SPEECH_MS / VAD_FRAME_MS)
 
@@ -122,6 +131,28 @@ static uint32_t frame_mean_abs(const int16_t *samples, size_t count) {
 }
 
 static inline uint32_t max_u32(uint32_t a, uint32_t b) { return a > b ? a : b; }
+
+static uint32_t eou_clamp_ms(uint32_t ms) {
+  if (ms < EOU_MIN_MS) {
+    return EOU_MIN_MS;
+  }
+  if (ms > EOU_MAX_MS) {
+    return EOU_MAX_MS;
+  }
+  return ms;
+}
+
+/** Recompute trailing-silence timeout from the longest completed mid-pause. */
+static uint32_t eou_recompute(uint32_t max_intra_pause_ms) {
+  uint32_t t = EOU_DEFAULT_MS;
+  if (max_intra_pause_ms > 0U) {
+    const uint32_t candidate = max_intra_pause_ms + EOU_MARGIN_MS;
+    if (candidate > t) {
+      t = candidate;
+    }
+  }
+  return eou_clamp_ms(t);
+}
 
 static uint32_t vad_start_threshold(uint32_t noise_floor) {
   return max_u32(VAD_MIN_START_ENERGY, noise_floor * 3U);
@@ -291,6 +322,9 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   uint32_t listen_frames = 0;
   uint32_t speech_streak = 0;
   uint32_t silence_streak = 0;
+  uint32_t adaptive_timeout_ms = EOU_DEFAULT_MS;
+  uint32_t max_intra_pause_ms = 0;
+  uint32_t intra_pause_count = 0;
   bool recording = false;
   esp_err_t result = ESP_FAIL;
 
@@ -317,13 +351,15 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     goto cleanup;
   }
 
+  nino_music_pause_for_speech(true);
   nino_voice_wake_set_mic_capture_hold(true);
   nino_mic_flush();
 
   /* Mic is live: show the listening face until this capture session ends. */
   nino_eye_listening();
 
-  ESP_LOGI(TAG, "VAD armed (max %d s)", max_seconds);
+  ESP_LOGI(TAG, "VAD armed (max %d s, EOU default=%d ms [%d-%d])", max_seconds, EOU_DEFAULT_MS,
+           EOU_MIN_MS, EOU_MAX_MS);
 
   while (1) {
     esp_err_t rr = nino_mic_read(cap.frame, VAD_FRAME_SAMPLES);
@@ -389,6 +425,19 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     const bool still_speaking = energy >= silence_end_th;
 
     if (still_speaking) {
+      /* speech → silence → speech: treat completed pause as intra-utterance. */
+      if (silence_streak > 0U) {
+        const uint32_t pause_ms = silence_streak * VAD_FRAME_MS;
+        if (pause_ms > max_intra_pause_ms) {
+          max_intra_pause_ms = pause_ms;
+        }
+        intra_pause_count++;
+        adaptive_timeout_ms = eou_recompute(max_intra_pause_ms);
+        ESP_LOGI(TAG,
+                 "EOU resume pause=%" PRIu32 "ms intra_max=%" PRIu32 " adaptive=%" PRIu32
+                 "ms count=%" PRIu32,
+                 pause_ms, max_intra_pause_ms, adaptive_timeout_ms, intra_pause_count);
+      }
       silence_streak = 0;
       cap.speaking_log_ms += VAD_FRAME_MS;
       if (cap.speaking_log_ms >= VAD_SPEAKING_LOG_PERIOD_MS) {
@@ -401,16 +450,22 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
       vad_update_noise_floor(&cap.noise_floor, energy, true);
       cap.speaking_log_ms += VAD_FRAME_MS;
       if (cap.speaking_log_ms >= VAD_SPEAKING_LOG_PERIOD_MS) {
-        ESP_LOGI(TAG, "VAD trailing energy=%" PRIu32 " peak=%" PRIu32 " end_th=%" PRIu32 " silence=%" PRIu32 "ms",
-                 energy, cap.peak_energy, silence_end_th, silence_streak * VAD_FRAME_MS);
+        ESP_LOGI(TAG,
+                 "VAD trailing energy=%" PRIu32 " peak=%" PRIu32 " end_th=%" PRIu32
+                 " silence=%" PRIu32 "ms adaptive=%" PRIu32 "ms",
+                 energy, cap.peak_energy, silence_end_th, silence_streak * VAD_FRAME_MS,
+                 adaptive_timeout_ms);
         cap.speaking_log_ms = 0;
       }
     }
 
-    if (silence_streak >= VAD_SILENCE_STOP_FRAMES &&
+    const uint32_t silence_ms = silence_streak * VAD_FRAME_MS;
+    if (silence_ms >= adaptive_timeout_ms &&
         (pcm_samples / VAD_FRAME_SAMPLES) >= VAD_MIN_SPEECH_FRAMES) {
-      ESP_LOGI(TAG, "VAD end on silence (peak=%" PRIu32 " end_th=%" PRIu32 ")", cap.peak_energy,
-               silence_end_th);
+      ESP_LOGI(TAG,
+               "EOU end silence=%" PRIu32 "ms adaptive=%" PRIu32 " intra_max=%" PRIu32
+               " peak=%" PRIu32 " end_th=%" PRIu32,
+               silence_ms, adaptive_timeout_ms, max_intra_pause_ms, cap.peak_energy, silence_end_th);
       break;
     }
 
@@ -483,6 +538,7 @@ static void voice_ws_job_task(void *pv) {
     ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
     free(resp);
     nino_eye_idle();
+    nino_music_pause_for_speech(false);
     vTaskDelete(NULL);
     return;
   }
@@ -542,6 +598,7 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool medical_ack_session) {
   if (uri[0] == '\0') {
     ESP_LOGW(TAG, "WS URI not set");
     nino_voice_wake_release_after_wake();
+    nino_music_pause_for_speech(false);
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -555,11 +612,16 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool medical_ack_session) {
     ESP_LOGE(TAG, "VAD capture failed: %s", esp_err_to_name(e));
     nino_eye_idle();
     nino_voice_wake_release_after_wake();
+    nino_music_pause_for_speech(false);
     return e;
   }
 
   nino_voice_wake_release_after_wake();
-  return spawn_voice_ws_job(cap, cap_len, uri, medical_ack_session);
+  e = spawn_voice_ws_job(cap, cap_len, uri, medical_ack_session);
+  if (e != ESP_OK) {
+    nino_music_pause_for_speech(false);
+  }
+  return e;
 }
 
 esp_err_t nino_voice_assist_run_query_only(void) {
@@ -579,6 +641,7 @@ static void prompt_listen_task(void *arg) {
     ESP_LOGW(TAG,
              "Prompt listen: PC voice not linked — need voice connect or "
              "X-Nino-Voice-Ws-Url from server");
+    nino_music_pause_for_speech(false);
     vTaskDelete(NULL);
     return;
   }
@@ -593,6 +656,7 @@ static void prompt_listen_task(void *arg) {
   esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, false);
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "Prompt listen voice query failed: %s", esp_err_to_name(e));
+    nino_music_pause_for_speech(false);
   }
   vTaskDelete(NULL);
 }
@@ -604,6 +668,7 @@ static void medical_ack_prompt_task(void *arg) {
   if (!nino_voice_assist_has_ws_uri()) {
     ESP_LOGW(TAG,
              "Medical ack: PC voice not linked — serial: voice connect <PC_LAN_IP> 8000");
+    nino_music_pause_for_speech(false);
     vTaskDelete(NULL);
     return;
   }
@@ -615,6 +680,7 @@ static void medical_ack_prompt_task(void *arg) {
   esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, true);
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "Medical ack voice query failed: %s", esp_err_to_name(e));
+    nino_music_pause_for_speech(false);
   }
   vTaskDelete(NULL);
 }
@@ -624,6 +690,7 @@ void nino_voice_assist_prompt_medical_ack(void) {
       xTaskCreate(prompt_listen_task, "prompt_listen", MED_ACK_TASK_STACK, NULL, 3, NULL);
   if (ok != pdPASS) {
     ESP_LOGW(TAG, "Could not start prompt listen task");
+    nino_music_pause_for_speech(false);
   }
 }
 

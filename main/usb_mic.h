@@ -16,8 +16,8 @@ esp_err_t usb_mic_phy_init_for_header(void);
 esp_err_t usb_mic_start(void);
 
 /**
- * Ignore UAC RX on this USB address (call when UVC camera enumerates on the J18 hub).
- * Prevents opening the camera's built-in microphone as the voice mic.
+ * Ignore UAC RX on this USB address (call when UVC camera enumerates on J18).
+ * Prevents opening the camera's built-in microphone instead of the ReSpeaker.
  */
 void usb_mic_block_dev_addr(uint8_t dev_addr);
 

@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 esp_err_t nino_audio_init(void);
@@ -47,6 +48,21 @@ esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz);
 /** Serialize access to the ES8311 speaker I2S path (playback). */
 void nino_audio_bus_lock(void);
 void nino_audio_bus_unlock(void);
+
+/**
+ * Open (or reopen) the speaker at @p sample_rate_hz. Caller must hold
+ * nino_audio_bus_lock(). No-ops if already open at the same rate.
+ */
+esp_err_t nino_audio_spk_open_locked(uint32_t sample_rate_hz);
+
+/** Close the speaker stream if open. Caller must hold nino_audio_bus_lock(). */
+void nino_audio_spk_close_locked(void);
+
+/**
+ * Write 16-bit mono PCM. Caller must hold nino_audio_bus_lock() and the
+ * stream must already be open. Does not close the codec.
+ */
+esp_err_t nino_audio_write_pcm16_mono_locked(const void *pcm, size_t bytes);
 
 /** Set speaker output volume percent (0-100). Persisted to NVS. */
 esp_err_t nino_audio_set_volume_percent(int volume_percent);

@@ -40,7 +40,7 @@ Architecture of the ESP32-P4 firmware in `main/`, from reset through every onboa
 | **PSRAM** | Used for UVC frames, face inference, large WAV buffers |
 | **Entry point** | `app_main()` in `main/main.c` |
 
-**Build dependencies** (`main/CMakeLists.txt`): Wi-Fi, HTTP server, mDNS, USB/UVC, esp-sr (wake word), esp32_p4_function_ev_board BSP, WebSocket client, Dynamixel over USB, ESP-DL face detect.
+**Build dependencies** (`main/CMakeLists.txt`): Wi-Fi, HTTP server, mDNS, USB/UVC, esp-tflite-micro + MicroWakeWord frontend (Ok Nino), esp32_p4_function_ev_board BSP, WebSocket client, Dynamixel over USB, ESP-DL face detect.
 
 **Embedded audio assets:** `WIFI.wav`, `Hello-home.wav`, `WIFI-UNABLE.wav`, `GO-APP.wav`, `PDTM.wav`, `beep.wav`
 
@@ -92,7 +92,7 @@ flowchart TB
     FaceTrack --> Servo
     UVC --> HTTP
     HTTP --> StreamConsumer
-    Wake[Wake word Hi ESP] --> VAD[voice_assist VAD]
+    Wake[Wake word Ok Nino] --> VAD[voice_assist VAD]
     VAD --> WS
     WS --> AudioQ[audio_queue]
     HTTP --> AudioQ
@@ -189,7 +189,7 @@ On dual-core builds: **Core 0 = network / voice / vision**, **Core 1 = USB**.
 | `audio_play` | 6K | 6 | — | WAV queue worker |
 | `touch_poll` | 4K | 5 | — | Capacitive sensor |
 | `dxl_*` / spin / hon | 4K | 4–18 | USB | Dynamixel |
-| `wake_feed` / `wake_fetch` | — | 3 | 1 / 0 | Wake word AFE |
+| `wake_detect` | 12K | 3 | 1 | MicroWakeWord Ok Nino |
 | `after_wake` | 20K | 3 | — | Post-wake voice pipeline |
 | `discovery` | 4K | 5 | NET | UDP multicast discover |
 | `tcp_server` | 4K | 5 | NET | Port 8888 messages |
@@ -342,7 +342,7 @@ sequenceDiagram
     participant Q as audio_queue
     participant Eye as nino_eye
 
-    User->>Wake: "Hi ESP"
+    User->>Wake: "Ok Nino"
     Wake->>Eye: listening
     Wake->>Wake: beep chime
     Wake->>VAD: run_query_only
@@ -356,9 +356,9 @@ sequenceDiagram
     Note over Q: prompt_medical_ack triggers second VAD listen
 ```
 
-**Wake word:** esp-sr WakeNet on `srmodels` partition; feed task on CPU1, fetch on CPU0.
+**Wake word:** MicroWakeWord `ok_nino_v6.tflite` ("Ok Nino"); detect task on CPU1.
 
-**VAD parameters:** 20 ms frames, 200 ms pre-roll, 700 ms trailing silence, 3 s listen timeout.
+**VAD parameters:** 20 ms frames, 200 ms pre-roll, adaptive EOU trailing silence (default 750 ms, clamp 500–1500 ms), 6 s listen timeout.
 
 **PC URL:** Stored in NVS; set via `voice connect <PC_IP> 8000`.
 

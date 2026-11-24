@@ -566,3 +566,43 @@ void nino_audio_bus_unlock(void) {
     xSemaphoreGive(s_mutex);
   }
 }
+
+#define AUDIO_WRITE_CHUNK 4096
+
+esp_err_t nino_audio_spk_open_locked(uint32_t sample_rate_hz) {
+  if (sample_rate_hz < 8000 || sample_rate_hz > 48000) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!s_ready || s_spk == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  return spk_stream_open_locked(sample_rate_hz, true);
+}
+
+void nino_audio_spk_close_locked(void) {
+  spk_stream_close_locked();
+}
+
+esp_err_t nino_audio_write_pcm16_mono_locked(const void *pcm, size_t bytes) {
+  if (!s_ready || s_spk == NULL || pcm == NULL || bytes == 0) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (!s_spk_stream_open) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  const uint8_t *play_ptr = (const uint8_t *)pcm;
+  size_t offset = 0;
+  while (offset < bytes) {
+    int block = (int)(bytes - offset);
+    if (block > AUDIO_WRITE_CHUNK) {
+      block = AUDIO_WRITE_CHUNK;
+    }
+    int cr = esp_codec_dev_write(s_spk, (void *)(play_ptr + offset), block);
+    if (cr != ESP_CODEC_DEV_OK) {
+      ESP_LOGE(TAG, "esp_codec_dev_write failed: %d", cr);
+      return ESP_FAIL;
+    }
+    offset += (size_t)block;
+  }
+  return ESP_OK;
+}
